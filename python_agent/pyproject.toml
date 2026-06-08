@@ -1,0 +1,14 @@
+[project]
+name = "python-agent"
+version = "0.1.0"
+description = "Agentic RPA Python Agent with PyO3 Rust bindings"
+requires-python = ">=3.10"
+dependencies = [
+    "langgraph>=0.1.0",
+    "google-genai>=0.1.0",
+    "maturin>=1.5.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"

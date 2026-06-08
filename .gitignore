@@ -1,0 +1,39 @@
+# --- Rust Ignored Files ---
+# Compiled binary layouts
+rust_core/target/
+**/*.rs.bk
+
+# --- Python Ignored Files ---
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+
+# C extensions
+python_agent/build/
+python_agent/dist/
+python_agent/local_packages/
+python_agent/*.egg-info/
+python_agent/.eggs/
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE and Editor Files
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+*~
+
+# OS Files
+.DS_Store
+Thumbs.db

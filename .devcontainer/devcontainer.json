@@ -1,0 +1,31 @@
+{
+  "name": "RPA Agent (Rust & Python)",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12",
+  "features": {
+    "ghcr.io/devcontainers/features/rust:1": {
+      "version": "latest",
+      "profile": "default"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "python.analysis.extraPaths": [
+          "${workspaceFolder}/python_agent"
+        ],
+        "rust-analyzer.linkedProjects": [
+          "${workspaceFolder}/rust_core/Cargo.toml"
+        ]
+      },
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "tamasfe.even-better-toml",
+        "charliermarsh.ruff"
+      ]
+    }
+  },
+  "postCreateCommand": "rustup update && pip install maturin uv"
+}
