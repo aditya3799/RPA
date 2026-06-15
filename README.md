@@ -176,17 +176,6 @@ python agent.py
 
 ---
 
-### 4. Production Packaging
-
-To compile a production-ready package (a `.whl` Wheel file) to distribute to other developers or servers:
-
-```bash
-cd rust_core
-maturin build --release
-```
-The compiled wheel file will be saved in the `rust_core/target/wheels/` directory, ready to be installed via `pip install <wheel_name>.whl`.
-
----
 
 ## OS-Specific Permissions
 
