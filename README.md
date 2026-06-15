@@ -8,25 +8,25 @@ A state-of-the-art, cross-platform OS-level Agentic Robotic Process Automation (
 
 ```mermaid
 graph TD
-    subgraph Python Agent (Orchestration)
+    subgraph PythonAgent ["Python Agent (Orchestration)"]
         LG[LangGraph State Machine] --> |Decision / Vision| AI[Gemini 2.5 API]
         LG --> |Commands| RC_Py[rust_core Python Binding]
     end
 
-    subgraph Rust Core (Engine)
+    subgraph RustCore ["Rust Core (Engine)"]
         RC_Py --> |PyO3 Bindings| RustLib[rust_core C-Dynamic Library]
         RustLib --> |Simulates OS Input| Enigo[Enigo Crate]
         RustLib --> |Captures Display| Scrap[Scrap Crate]
     end
 
-    subgraph Operating System
+    subgraph OperatingSystem ["Operating System"]
         Enigo --> |Mouse / Keyboard events| OS[OS APIs: Win32 / CoreGraphics]
         OS --> |Screen Frame Buffer| Scrap
     end
 
-    style Python Agent fill:#2c3e50,stroke:#34495e,stroke-width:2px,color:#fff
-    style Rust Core fill:#d35400,stroke:#e67e22,stroke-width:2px,color:#fff
-    style Operating System fill:#7f8c8d,stroke:#95a5a6,stroke-width:2px,color:#fff
+    style PythonAgent fill:#2c3e50,stroke:#34495e,stroke-width:2px,color:#fff
+    style RustCore fill:#d35400,stroke:#e67e22,stroke-width:2px,color:#fff
+    style OperatingSystem fill:#7f8c8d,stroke:#95a5a6,stroke-width:2px,color:#fff
 ```
 ---
 
