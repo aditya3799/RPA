@@ -247,6 +247,10 @@ def convert_bgra_to_base64_jpeg(width: int, height: int, raw_bgra: bytes) -> str
 
 def native_mac_click(x: int, y: int):
     """Simulate a native macOS mouse click using Quartz to guarantee perfect coordinates."""
+    if sys.platform != "darwin":
+        rust_core.click_mouse(x, y)
+        return
+        
     try:
         import Quartz
         # Move
@@ -555,31 +559,37 @@ def execute_action_node(state: RPAState) -> dict:
                 native_mac_click(x, y)
                 time.sleep(0.5)  # Wait for focus to register
                 
-            print(f"Executing: Typing text: '{text}' using macOS osascript")
-            import subprocess
-            safe_text = text.replace('\\', '\\\\').replace('"', '\\"')
-            res = subprocess.run(["osascript", "-e", f'tell application "System Events" to keystroke "{safe_text}"'], capture_output=True, text=True)
-            if res.returncode != 0:
-                print(f"[osascript Error] {res.stderr.strip()}")
-            time.sleep(0.1)  # Fast typed state
-        elif action_type == "press":
-            key = action_data.get("key", "").lower()
-            print(f"Executing: Pressing key: '{key}' using macOS osascript")
-            import subprocess
-            key_codes = {
-                "enter": 36, "return": 36,
-                "escape": 53, "esc": 53,
-                "tab": 48,
-                "backspace": 51,
-                "space": 49
-            }
-            code = key_codes.get(key)
-            if code is not None:
-                res = subprocess.run(["osascript", "-e", f'tell application "System Events" to key code {code}'], capture_output=True, text=True)
+            if sys.platform == "darwin":
+                print(f"Executing: Typing text: '{text}' using macOS osascript")
+                safe_text = text.replace('\\', '\\\\').replace('"', '\\"')
+                res = subprocess.run(["osascript", "-e", f'tell application "System Events" to keystroke "{safe_text}"'], capture_output=True, text=True)
                 if res.returncode != 0:
                     print(f"[osascript Error] {res.stderr.strip()}")
             else:
-                print(f"[Warning] Unknown key code for '{key}'")
+                print(f"Executing: Typing text: '{text}' using rust_core")
+                rust_core.type_text(text)
+            time.sleep(0.1)  # Fast typed state
+        elif action_type == "press":
+            key = action_data.get("key", "").lower()
+            if sys.platform == "darwin":
+                print(f"Executing: Pressing key: '{key}' using macOS osascript")
+                key_codes = {
+                    "enter": 36, "return": 36,
+                    "escape": 53, "esc": 53,
+                    "tab": 48,
+                    "backspace": 51,
+                    "space": 49
+                }
+                code = key_codes.get(key)
+                if code is not None:
+                    res = subprocess.run(["osascript", "-e", f'tell application "System Events" to key code {code}'], capture_output=True, text=True)
+                    if res.returncode != 0:
+                        print(f"[osascript Error] {res.stderr.strip()}")
+                else:
+                    print(f"[Warning] Unknown key code for '{key}'")
+            else:
+                print(f"Executing: Pressing key: '{key}' using rust_core")
+                rust_core.press_key(key)
             time.sleep(0.1)  # Fast key press state
         elif action_type == "command":
             cmd = action_data.get("command", "")
