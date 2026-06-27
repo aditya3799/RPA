@@ -3,6 +3,9 @@ import io
 import json
 import base64
 import time
+import sys
+import subprocess
+import tempfile
 import psutil
 import requests
 from typing import TypedDict, Optional, Union, List
@@ -43,6 +46,18 @@ except ImportError:
 # Supermemory API Configuration
 SUPERMEMORY_API_KEY = os.environ.get("SUPERMEMORY_API_KEY", "")
 SUPERMEMORY_API_URL = "https://api.supermemory.ai/v4"
+SCREENSHOT_OUTPUT_DIR = "/Users/aaditeshkadu/Desktop/Dev Projects/RPA/Screenshots"
+
+
+def _supermemory_session() -> requests.Session:
+    """Create a requests session that does not consult system proxy settings.
+
+    macOS proxy discovery can crash in background threads in this environment,
+    so Supermemory calls use a direct session instead.
+    """
+    session = requests.Session()
+    session.trust_env = False
+    return session
 
 # Try to import our compiled Rust core (available after running maturin develop/build)
 try:
@@ -55,8 +70,8 @@ except ImportError:
         def move_mouse_to(x: int, y: int):
             print(f"[Mock Rust Core] Moving mouse to ({x}, {y})")
         @staticmethod
-        def click_mouse():
-            print("[Mock Rust Core] Simulating left click")
+        def click_mouse(x: int = 0, y: int = 0):
+            print(f"[Mock Rust Core] Simulating left click at ({x}, {y})")
         @staticmethod
         def type_text(text: str):
             print(f"[Mock Rust Core] Simulating typing: '{text}'")
@@ -68,6 +83,9 @@ except ImportError:
             print("[Mock Rust Core] Simulating screen capture (1920x1080)")
             # 1920 * 1080 * 4 bytes of mock RGBA/BGRA pixels
             return (1920, 1080, b'\x00' * (1920 * 1080 * 4))
+        @staticmethod
+        def get_logical_screen_size():
+            return (1920.0, 1080.0)
     rust_core = MockRustCore()
 
 class RPAState(dict):
@@ -81,6 +99,132 @@ class RPAState(dict):
     final_response: Optional[str]
     completed: bool
     history: List[str]
+
+def _ensure_pixel_bytes(raw_pixels) -> bytes:
+    if isinstance(raw_pixels, bytes):
+        return raw_pixels
+    if isinstance(raw_pixels, list):
+        return bytes(raw_pixels)
+    return bytes(raw_pixels)
+
+
+def _is_invalid_capture(width: int, height: int, raw_bgra: bytes) -> bool:
+    """Detect unusable captures such as tiny, empty, or all-zero buffers."""
+    if width < 100 or height < 100:
+        return True
+    expected = width * height * 4
+    if not raw_bgra or len(raw_bgra) != expected:
+        return True
+    # Check for blank (all-zero) frames by sampling every ~1000th pixel.
+    # If every sampled pixel is zero, the frame is blank.
+    step = max(4, len(raw_bgra) // 1000)  # sample ~1000 points
+    step = step - (step % 4)  # align to pixel boundary
+    if all(raw_bgra[i] == 0 for i in range(0, len(raw_bgra), step)):
+        return True
+    return False
+
+
+def _mac_logical_screen_size() -> Optional[tuple[int, int]]:
+    """Best-effort logical screen size for aligning captures with mouse coordinates."""
+    try:
+        width, height, _raw = rust_core.capture_screen()
+        return int(width), int(height)
+    except Exception:
+        return None
+
+
+def _capture_screen_macos_fallback() -> Optional[tuple[int, int, bytes]]:
+    """Use macOS screencapture when the Rust capturer returns unusable frames.
+
+    IMPORTANT: This must NOT call rust_core.capture_screen() (directly or
+    via helpers like _mac_logical_screen_size), because this fallback is
+    invoked precisely when the Rust capturer is broken or crashing.
+    """
+    if sys.platform != "darwin" or not HAS_PILLOW:
+        return None
+
+    fd, path = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        subprocess.run(
+            ["screencapture", "-x", path],
+            check=True,
+            timeout=15,
+        )
+        image = Image.open(path).convert("RGBA")
+        # Retina displays produce 2x images; downscale so pixel
+        # coordinates match the logical mouse coordinate space.
+        if image.width > 2000:
+            image = image.resize(
+                (image.width // 2, image.height // 2),
+                Image.Resampling.LANCZOS,
+            )
+        width, height = image.size
+        raw_bgra = image.tobytes("raw", "BGRA")
+        return width, height, raw_bgra
+    except Exception as e:
+        print(f"[Screenshot Fallback Error] macOS screencapture failed: {e}")
+        return None
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def capture_screen_with_fallback() -> tuple[int, int, bytes]:
+    """Capture the screen via Rust, falling back to macOS screencapture if needed."""
+    try:
+        width, height, raw_pixels = rust_core.capture_screen()
+        raw_pixels = _ensure_pixel_bytes(raw_pixels)
+        print(
+            f"[Rust Core Success] Captured display: {width}x{height} "
+            f"(Buffer size: {len(raw_pixels)} bytes)"
+        )
+        if not _is_invalid_capture(width, height, raw_pixels):
+            # CGDisplayCreateImage returns physical Retina pixels
+            # (e.g. 3420×2214).  Downscale to logical resolution so
+            # mouse-click coordinates from the vision model line up.
+            try:
+                logical_w, logical_h = rust_core.get_logical_screen_size()
+            except AttributeError:
+                # Fallback if rust core is outdated
+                logical_w, logical_h = width // 2, height // 2
+
+            if HAS_PILLOW and logical_w > 0 and logical_h > 0 and (width != int(logical_w) or height != int(logical_h)):
+                img = Image.frombytes(
+                    "RGBA", (width, height), raw_pixels, "raw", "BGRA"
+                )
+                img = img.resize(
+                    (int(logical_w), int(logical_h)),
+                    Image.Resampling.LANCZOS,
+                )
+                width, height = img.size
+                raw_pixels = img.tobytes("raw", "BGRA")
+                print(
+                    f"[Scaling] Resized to {width}x{height} "
+                    f"for logical coordinate alignment"
+                )
+            return width, height, raw_pixels
+        print("[Screenshot Warning] Rust capture returned an invalid/blank frame.")
+    except Exception as e:
+        print(f"[Rust Core Error] Screen capture failed: {e}")
+
+    fallback = _capture_screen_macos_fallback()
+    if fallback:
+        width, height, raw_pixels = fallback
+        print(
+            f"[Screenshot Fallback] Captured display via screencapture: "
+            f"{width}x{height} (Buffer size: {len(raw_pixels)} bytes)"
+        )
+        return width, height, raw_pixels
+
+    print(
+        "[Screenshot Warning] Capture failed. On macOS, grant Screen Recording permission "
+        "to Terminal/Cursor/Python in System Settings > Privacy & Security."
+    )
+    return 1920, 1080, b""
+
 
 # Helper to convert raw BGRA pixels to base64 encoded JPEG
 def convert_bgra_to_base64_jpeg(width: int, height: int, raw_bgra: bytes) -> str:
@@ -100,6 +244,45 @@ def convert_bgra_to_base64_jpeg(width: int, height: int, raw_bgra: bytes) -> str
     except Exception as e:
         print(f"Error converting screen image: {e}")
         return "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+
+def native_mac_click(x: int, y: int):
+    """Simulate a native macOS mouse click using Quartz to guarantee perfect coordinates."""
+    try:
+        import Quartz
+        # Move
+        move_event = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventMouseMoved, (x, y), Quartz.kCGMouseButtonLeft)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, move_event)
+        time.sleep(0.05)
+        # Down
+        down_event = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventLeftMouseDown, (x, y), Quartz.kCGMouseButtonLeft)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, down_event)
+        time.sleep(0.05)
+        # Up
+        up_event = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventLeftMouseUp, (x, y), Quartz.kCGMouseButtonLeft)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, up_event)
+    except Exception as e:
+        print(f"[Quartz Error] Failed to click: {e}")
+        # Fallback to rust_core if Quartz fails
+        rust_core.click_mouse(x, y)
+
+
+def save_screen_capture_image(width: int, height: int, raw_bgra: bytes) -> Optional[str]:
+    """Save the captured screen image to the screenshots folder."""
+    if not HAS_PILLOW or not raw_bgra:
+        return None
+
+    try:
+        os.makedirs(SCREENSHOT_OUTPUT_DIR, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        filename = f"screen-{timestamp}.png"
+        output_path = os.path.join(SCREENSHOT_OUTPUT_DIR, filename)
+
+        image = Image.frombytes("RGBA", (width, height), raw_bgra, "raw", "BGRA")
+        image.save(output_path, format="PNG")
+        return output_path
+    except Exception as e:
+        print(f"[Screenshot Warning] Failed to save screen capture: {e}")
+        return None
 
 # Node 1: Capture screen using the Rust core extension
 def capture_screen_node(state: RPAState) -> dict:
@@ -125,13 +308,15 @@ def capture_screen_node(state: RPAState) -> dict:
     except Exception as e:
         process_state = f"Failed to read processes: {e}"
 
-    try:
-        width, height, raw_pixels = rust_core.capture_screen()
-        print(f"[Rust Core Success] Captured display: {width}x{height} (Buffer size: {len(raw_pixels)} bytes)")
-        return {"screenshot_data": (width, height, raw_pixels), "fs_state": fs_state, "process_state": process_state}
-    except Exception as e:
-        print(f"[Rust Core Error] Screen capture failed: {e}")
-        return {"screenshot_data": (1920, 1080, b''), "fs_state": fs_state, "process_state": process_state}
+    width, height, raw_pixels = capture_screen_with_fallback()
+    saved_path = save_screen_capture_image(width, height, raw_pixels)
+    if saved_path:
+        print(f"[Screenshot Saved] {saved_path}")
+    return {
+        "screenshot_data": (width, height, raw_pixels),
+        "fs_state": fs_state,
+        "process_state": process_state,
+    }
 
 def query_supermemory(query: str) -> str:
     if not SUPERMEMORY_API_KEY:
@@ -139,7 +324,7 @@ def query_supermemory(query: str) -> str:
     try:
         headers = {"Authorization": f"Bearer {SUPERMEMORY_API_KEY}", "Content-Type": "application/json"}
         payload = {"q": query, "searchMode": "hybrid", "limit": 3, "containerTag": "rpa_agent_memory"}
-        resp = requests.post(f"{SUPERMEMORY_API_URL}/search", headers=headers, json=payload, timeout=10)
+        resp = _supermemory_session().post(f"{SUPERMEMORY_API_URL}/search", headers=headers, json=payload, timeout=10)
         if resp.status_code == 200:
             results = resp.json().get("results", [])
             context_list = []
@@ -169,7 +354,7 @@ def save_to_supermemory(title: str, content: str):
             ],
             "containerTag": "rpa_agent_memory"
         }
-        resp = requests.post(f"{SUPERMEMORY_API_URL}/memories", headers=headers, json=payload, timeout=10)
+        resp = _supermemory_session().post(f"{SUPERMEMORY_API_URL}/memories", headers=headers, json=payload, timeout=10)
         if resp.status_code not in (200, 201):
             print(f"[Supermemory Warning] Failed to save memory: HTTP {resp.status_code} - {resp.text}")
     except Exception as e:
@@ -263,19 +448,18 @@ If you see that you already executed a command to open an app or typed text, DO 
 
 CRITICAL BEHAVIOR RULES:
 1. APP LAUNCHING: DO NOT try to click taskbar icons, start menus, or desktop shortcuts to open applications. If the required application is not currently open and visible, you MUST use the "command" action to launch it via an OS-level terminal command. For example, to open a search engine or web page on Windows, output a "command" action with `start chrome "https://url.com"`.
-2. VISION CONFIRMATION: Once an application is open, use the vision model to confirm the correct tab or window is visible before proceeding.
-3. IN-APP INTERACTION: ONLY use "click", "type", and "press" actions to interact with elements *inside* an application after it has been opened.
+2. VISION CONFIRMATION: Once an application is open, use the vision model to confirm the correct tab or window is visible before proceeding.3. IN-APP INTERACTION: ONLY use "click", "type", and "press" actions to interact with elements *inside* an application. Note: If an input field is not currently focused, you MUST provide "x" and "y" coordinates in your "type" action so the system can click it to focus before typing.
 4. BACKGROUND EXECUTION: "command" and "python_tool" run entirely in the background. Their output will appear in the LAST BACKGROUND TERMINAL OUTPUT section on the next turn. Do NOT open visible cmd.exe or terminal windows just to see output.
-5. FILE SAVING: If your objective requires you to create, save, or download a file, you MUST save it into a folder named `results` located in the current working directory. Always prepend `results\\` or `results/` to the filename when typing it into a save dialog or command.
-6. TOOL USE (BASH vs PYTHON): You can dynamically choose to execute raw OS terminal commands using the "command" action, or execute Python automation scripts using the "python_tool" action. If you need to perform complex data manipulation, file processing, or API calls, use "python_tool". For simple OS integrations (launching apps, moving files), use "command".
+5. FILE SAVING: If your objective requires you to create, save, or download a file, you MUST save it into a folder named `results` located in the current working directory. Always prepend `results\\` or `results/` to the filename when typing it into a save dialog or command.6. TOOL USE (BASH vs PYTHON): You can dynamically choose to execute raw OS terminal commands using the "command" action, or execute Python automation scripts using the "python_tool" action. If you need to perform complex data manipulation, file processing, or API calls, use "python_tool". For simple OS integrations (launching apps, moving files), use "command".
 7. LEVERAGE SUPERMEMORY: If the SUPERMEMORY PAST KNOWLEDGE section contains a past successful run for a similar task, you MUST prioritize using the exact commands or steps that were successful previously, rather than starting from scratch or re-inventing the solution.
+8. COORDINATE SYSTEM: You MUST output "x" and "y" as normalized relative coordinates on a 0 to 1000 scale. For example, x=0 is the left edge, x=1000 is the right edge, x=500 is exactly in the horizontal center. Do NOT output absolute pixel coordinates.
 
 You MUST respond ONLY with a raw JSON block in this exact format (no markdown code blocks, no ```json wrapper):
 {{
   "action": "click" | "type" | "press" | "wait" | "command" | "python_tool" | "save_file" | "done",
   "reason": "Brief explanation of what this action does and why you chose it",
-  "x": <integer x coordinate, required if action is click>,
-  "y": <integer y coordinate, required if action is click>,
+  "x": <integer from 0 to 1000 representing the relative X coordinate, required if action is click or type>,
+  "y": <integer from 0 to 1000 representing the relative Y coordinate, required if action is click or type>,
   "text": "<string to type if action is type, or final summary message for the user if action is done>",
   "key": "enter" | "escape" | "tab" | "backspace" | "space" <required if action is press>,
   "command": "<terminal/os command to run, required if action is command>",
@@ -322,6 +506,9 @@ Notes:
         return {"next_action": cleaned_text}
     except Exception as e:
         print(f"[API Error] Request failed: {e}")
+        error_text = str(e).lower()
+        if "402" in error_text or "depleted" in error_text or "credits" in error_text:
+            return {"next_action": '{"action": "done", "reason": "Hugging Face credits exhausted", "text": "Stopped because the Hugging Face provider ran out of credits."}'}
         return {"next_action": '{"action": "wait", "reason": "API request failed"}'}
 
 # Node 3: Execute the action via Rust core input simulation
@@ -343,22 +530,56 @@ def execute_action_node(state: RPAState) -> dict:
             print(f"AI Decision Reason: {reason}")
             
         if action_type == "click":
-            x = int(action_data.get("x", 0))
-            y = int(action_data.get("y", 0))
-            print(f"Executing: Mouse click at ({x}, {y})")
-            rust_core.move_mouse_to(x, y)
-            time.sleep(0.1)  # Allow hover state to register (fast)
-            rust_core.click_mouse()
+            x_rel = int(action_data.get("x", 0))
+            y_rel = int(action_data.get("y", 0))
+            x, y = x_rel, y_rel
+            if "screenshot_data" in state and state["screenshot_data"]:
+                w, h, _ = state["screenshot_data"]
+                x = int((x_rel / 1000.0) * w)
+                y = int((y_rel / 1000.0) * h)
+            print(f"Executing: Mouse click at ({x}, {y}) [Scaled from relative {x_rel}, {y_rel}] using native Quartz")
+            native_mac_click(x, y)
             time.sleep(0.1)  # Allow UI to react before next screenshot
         elif action_type == "type":
+            x_rel = int(action_data.get("x", 0))
+            y_rel = int(action_data.get("y", 0))
+            x, y = x_rel, y_rel
+            if "screenshot_data" in state and state["screenshot_data"]:
+                w, h, _ = state["screenshot_data"]
+                x = int((x_rel / 1000.0) * w)
+                y = int((y_rel / 1000.0) * h)
+                
             text = action_data.get("text", "")
-            print(f"Executing: Typing text: '{text}'")
-            rust_core.type_text(text)
+            if x != 0 or y != 0:
+                print(f"Executing: Focusing field via click at ({x}, {y}) before typing [Scaled from relative {x_rel}, {y_rel}]")
+                native_mac_click(x, y)
+                time.sleep(0.5)  # Wait for focus to register
+                
+            print(f"Executing: Typing text: '{text}' using macOS osascript")
+            import subprocess
+            safe_text = text.replace('\\', '\\\\').replace('"', '\\"')
+            res = subprocess.run(["osascript", "-e", f'tell application "System Events" to keystroke "{safe_text}"'], capture_output=True, text=True)
+            if res.returncode != 0:
+                print(f"[osascript Error] {res.stderr.strip()}")
             time.sleep(0.1)  # Fast typed state
         elif action_type == "press":
-            key = action_data.get("key", "")
-            print(f"Executing: Pressing key: '{key}'")
-            rust_core.press_key(key)
+            key = action_data.get("key", "").lower()
+            print(f"Executing: Pressing key: '{key}' using macOS osascript")
+            import subprocess
+            key_codes = {
+                "enter": 36, "return": 36,
+                "escape": 53, "esc": 53,
+                "tab": 48,
+                "backspace": 51,
+                "space": 49
+            }
+            code = key_codes.get(key)
+            if code is not None:
+                res = subprocess.run(["osascript", "-e", f'tell application "System Events" to key code {code}'], capture_output=True, text=True)
+                if res.returncode != 0:
+                    print(f"[osascript Error] {res.stderr.strip()}")
+            else:
+                print(f"[Warning] Unknown key code for '{key}'")
             time.sleep(0.1)  # Fast key press state
         elif action_type == "command":
             cmd = action_data.get("command", "")
@@ -610,12 +831,14 @@ if __name__ == "__main__":
         else:
             print("No objective provided. Exiting.")
     else:
-        print("Starting Spotlight UI. Press Ctrl+Space to toggle.")
+        print("🚀 Starting macOS RPA Control UI...")
+        print("💡 Press Ctrl+Shift+Space to toggle the UI")
         try:
-            from ui import run_ui
-            run_ui()
+            from mac_ui import run_mac_ui
+            run_mac_ui()
         except ImportError as e:
-            print(f"Error loading UI: {e}")
+            print(f"Error loading Mac UI: {e}")
+            print("Falling back to command-line mode...")
             objective = input("Enter the objective for the RPA agent: ")
             if objective.strip():
                 run_agent(objective.strip())
